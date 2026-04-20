@@ -1,19 +1,32 @@
 # ── video_capture.py ──────────────────────────────────────────
 # Cattura video in thread separato.
 #
-# Due modalità a seconda della sorgente:
-#   FILE  → coda (queue): ogni frame viene consegnato in ordine,
-#           nessun frame perso. Il thread si ferma se la coda è
-#           piena, aspettando che il main consumi.
-#   LIVE  → buffer singolo: il main legge sempre l'ultimo frame,
-#           senza accumulare ritardo.
+# Tre modalità a seconda della sorgente:
+#   FILE  → ThreadedCapture con coda: ogni frame in ordine, nessun
+#           frame perso.
+#   LIVE (webcam/RTSP) → ThreadedCapture con buffer singolo: il main
+#           legge sempre l'ultimo frame.
+#   HTTP (Render/remoto) → HttpPollingCapture: polling periodico di
+#           un endpoint che restituisce JPEG.
 # ──────────────────────────────────────────────────────────────
 
 import cv2
+import numpy as np
 import threading
 import queue
 import time
 
+try:
+    import urllib.request
+    import urllib.error
+    _HAS_URLLIB = True
+except ImportError:
+    _HAS_URLLIB = False
+
+
+# ══════════════════════════════════════════════════════════════
+# ThreadedCapture — per file, webcam, RTSP
+# ══════════════════════════════════════════════════════════════
 
 class ThreadedCapture:
     """
@@ -28,13 +41,6 @@ class ThreadedCapture:
 
     def __init__(self, source, reconnect=True, reconnect_delay=3.0,
                  queue_size=128):
-        """
-        Args:
-            source:          percorso file, indice webcam (int), o URL RTSP
-            reconnect:       riconnessione automatica (solo stream)
-            reconnect_delay: secondi tra tentativi
-            queue_size:      dimensione coda per modalità file
-        """
         self.source = source
         self.reconnect = reconnect
         self.reconnect_delay = reconnect_delay
@@ -43,22 +49,18 @@ class ThreadedCapture:
         self._cap = None
         self._running = False
         self._thread = None
-        self._finished = False  # True quando il file è finito
+        self._finished = False
 
-        # Modalità file: coda ordinata
         self._queue = None
-        # Modalità live: buffer singolo
         self._frame = None
         self._lock = threading.Lock()
 
-        # Proprietà video (disponibili dopo start)
         self.width = 0
         self.height = 0
         self.fps = 0
-        self.total_frames = 0  # 0 per stream live
+        self.total_frames = 0
 
     def start(self):
-        """Apre la sorgente e avvia il thread di cattura."""
         self._cap = cv2.VideoCapture(self.source)
         if not self._cap.isOpened():
             raise ConnectionError(
@@ -73,7 +75,6 @@ class ThreadedCapture:
         if self.total_frames <= 0:
             self.total_frames = 0
 
-        # Scegli modalità
         if self.is_file():
             self._queue = queue.Queue(maxsize=self._queue_size)
         else:
@@ -97,38 +98,24 @@ class ThreadedCapture:
         return self
 
     def read(self):
-        """
-        Restituisce il prossimo frame.
-
-        FILE:  blocca fino a 0.1s, restituisce None se la coda è vuota
-               e il video non è finito. Restituisce None definitivo
-               quando il file è terminato e la coda è vuota.
-        LIVE:  restituisce l'ultimo frame (o None se non disponibile).
-        """
         if self._queue is not None:
-            # Modalità FILE: leggi dalla coda in ordine
             try:
                 return self._queue.get(timeout=0.1)
             except queue.Empty:
                 return None
         else:
-            # Modalità LIVE: ultimo frame
             with self._lock:
                 return self._frame.copy() if self._frame is not None else None
 
     def is_running(self):
-        """True se ci sono ancora frame da consumare."""
         if self._queue is not None:
-            # Per file: running finché la coda non è vuota E il thread non ha finito
             return self._running or not self._queue.empty()
         return self._running
 
     def is_file(self):
-        """True se la sorgente è un file."""
         return self.total_frames > 0
 
     def stop(self):
-        """Ferma il thread e rilascia la sorgente."""
         self._running = False
         if self._thread is not None:
             self._thread.join(timeout=5.0)
@@ -137,7 +124,6 @@ class ThreadedCapture:
         print("[Capture] Sorgente chiusa.")
 
     def _capture_loop(self):
-        """Loop interno del thread."""
         consecutive_failures = 0
         MAX_FAILURES = 30
 
@@ -153,12 +139,10 @@ class ThreadedCapture:
 
             if not ret:
                 consecutive_failures += 1
-
                 if self.is_file():
                     print("\n[Capture] Fine del video.")
                     self._running = False
                     break
-
                 if consecutive_failures >= MAX_FAILURES:
                     print(f"[Capture] {consecutive_failures} frame falliti, "
                           f"riconnessione...")
@@ -173,7 +157,6 @@ class ThreadedCapture:
             consecutive_failures = 0
 
             if self._queue is not None:
-                # Modalità FILE: metti in coda (blocca se piena)
                 while self._running:
                     try:
                         self._queue.put(frame, timeout=0.5)
@@ -181,23 +164,189 @@ class ThreadedCapture:
                     except queue.Full:
                         continue
             else:
-                # Modalità LIVE: sovrascrivi ultimo frame
                 with self._lock:
                     self._frame = frame
 
         self._running = False
 
     def _try_reconnect(self):
-        """Tenta di riconnettersi alla sorgente."""
         print(f"[Capture] Riconnessione a {self.source} "
               f"tra {self.reconnect_delay}s...")
         if self._cap is not None:
             self._cap.release()
-
         time.sleep(self.reconnect_delay)
-
         self._cap = cv2.VideoCapture(self.source)
         if self._cap.isOpened():
             print("[Capture] Riconnesso!")
         else:
             print("[Capture] Riconnessione fallita, riprovo...")
+
+
+# ══════════════════════════════════════════════════════════════
+# HttpPollingCapture — per sorgenti HTTP (es. Render server)
+# ══════════════════════════════════════════════════════════════
+
+class HttpPollingCapture:
+    """
+    Cattura frame da un endpoint HTTP che restituisce immagini JPEG.
+
+    Il thread di polling scarica periodicamente l'immagine dall'URL
+    e la decodifica in un frame BGR numpy. Il main legge sempre
+    l'ultimo frame disponibile.
+
+    Pensato per il pattern:
+      Telefono → POST /upload (JPEG) → Server Render
+      PC       → GET  /frame         → Server Render (questa classe)
+
+    Uso:
+        cap = HttpPollingCapture("https://mioserver.onrender.com/frame")
+        cap.start()
+        while cap.is_running():
+            frame = cap.read()
+            ...
+        cap.stop()
+    """
+
+    def __init__(self, url, poll_interval=0.15, timeout=5.0,
+                 reconnect_delay=3.0):
+        """
+        Args:
+            url:            URL completo dell'endpoint (es. https://.../frame)
+            poll_interval:  secondi tra una richiesta e l'altra
+            timeout:        timeout HTTP per singola richiesta
+            reconnect_delay: pausa dopo errori consecutivi
+        """
+        self.source = url
+        self.poll_interval = poll_interval
+        self._timeout = timeout
+        self.reconnect_delay = reconnect_delay
+
+        self._frame = None
+        self._lock = threading.Lock()
+        self._running = False
+        self._thread = None
+
+        # Proprietà — saranno impostate dopo il primo frame ricevuto
+        self.width = 0
+        self.height = 0
+        self.fps = 0        # stimato dal poll_interval
+        self.total_frames = 0  # sempre 0 (è live)
+
+        self._frames_ricevuti = 0
+        self._frames_vuoti = 0  # frame identici (nessun nuovo frame dal telefono)
+        self._ultimo_hash = None
+
+    def start(self):
+        """Testa la connessione e avvia il thread di polling."""
+        print(f"[HTTP] Connessione a {self.source}...")
+
+        # Primo tentativo per verificare che l'endpoint risponda
+        frame = self._scarica_frame()
+
+        if frame is None:
+            # Potrebbe essere che il telefono non ha ancora mandato frame.
+            # Non è un errore fatale: il thread aspetterà.
+            print(f"[HTTP] Nessun frame disponibile ancora (il telefono "
+                  f"sta inviando?)")
+            print(f"[HTTP] Attendo frame dal server...")
+        else:
+            self.height, self.width = frame.shape[:2]
+            with self._lock:
+                self._frame = frame
+            print(f"[HTTP] Primo frame ricevuto: {self.width}x{self.height}")
+
+        self.fps = 1.0 / self.poll_interval if self.poll_interval > 0 else 10.0
+
+        self._running = True
+        self._thread = threading.Thread(target=self._poll_loop, daemon=True)
+        self._thread.start()
+
+        print(f"[HTTP] Polling attivo ogni {self.poll_interval*1000:.0f}ms "
+              f"(~{self.fps:.0f} FPS)")
+
+        return self
+
+    def read(self):
+        """Restituisce l'ultimo frame ricevuto (o None)."""
+        with self._lock:
+            return self._frame.copy() if self._frame is not None else None
+
+    def is_running(self):
+        return self._running
+
+    def is_file(self):
+        return False  # sempre live
+
+    def stop(self):
+        self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+        print(f"[HTTP] Polling fermato. Frame ricevuti: {self._frames_ricevuti}")
+
+    def _poll_loop(self):
+        """Loop di polling: scarica frame periodicamente."""
+        consecutive_errors = 0
+        MAX_ERRORS = 10
+
+        while self._running:
+            t_start = time.time()
+
+            frame = self._scarica_frame()
+
+            if frame is not None:
+                consecutive_errors = 0
+                self._frames_ricevuti += 1
+
+                # Aggiorna dimensioni se è il primo frame
+                if self.width == 0:
+                    self.height, self.width = frame.shape[:2]
+                    print(f"[HTTP] Primo frame ricevuto: "
+                          f"{self.width}x{self.height}")
+
+                with self._lock:
+                    self._frame = frame
+            else:
+                consecutive_errors += 1
+                if consecutive_errors >= MAX_ERRORS:
+                    print(f"[HTTP] {consecutive_errors} errori consecutivi, "
+                          f"pausa {self.reconnect_delay}s...")
+                    time.sleep(self.reconnect_delay)
+                    consecutive_errors = 0
+
+            # Aspetta il tempo rimanente per rispettare poll_interval
+            elapsed = time.time() - t_start
+            sleep_time = self.poll_interval - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+        self._running = False
+
+    def _scarica_frame(self):
+        """Scarica un singolo frame JPEG dall'endpoint e lo decodifica."""
+        try:
+            req = urllib.request.Request(self.source)
+            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+                if resp.status != 200:
+                    return None
+                data = resp.read()
+                if not data:
+                    return None
+
+            # Decodifica JPEG → numpy BGR
+            arr = np.frombuffer(data, dtype=np.uint8)
+            frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            return frame
+
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                # Nessun frame disponibile (telefono non ha ancora mandato)
+                pass
+            else:
+                print(f"[HTTP] Errore HTTP {e.code}: {e.reason}")
+            return None
+        except urllib.error.URLError as e:
+            print(f"[HTTP] Errore connessione: {e.reason}")
+            return None
+        except Exception as e:
+            print(f"[HTTP] Errore: {e}")
+            return None

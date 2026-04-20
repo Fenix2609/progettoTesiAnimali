@@ -12,13 +12,18 @@
 # ──────────────────────────────────────────────────────────────
 
 import argparse
+import queue
 import sys
+import threading
 import time
 import cv2
 
-from config import FINESTRA_NOME, MAX_DISPLAY_WIDTH, CUSTOM_MODEL_PATH
+from config import (
+    FINESTRA_NOME, MAX_DISPLAY_WIDTH, CUSTOM_MODEL_PATH,
+    BUFFER_RAM_FRACTION, BUFFER_PREFILL_SECONDS,
+)
 from detector import DualDetector
-from video_capture import ThreadedCapture
+from video_capture import ThreadedCapture, HttpPollingCapture
 from recorder import VideoRecorder, make_output_path
 
 
@@ -111,11 +116,55 @@ def _stampa_eventi(detector):
             print(f"\n  <<< USCITA:   {ev['nome']} è uscito dal campo visivo")
 
 
+def _calcola_buffer_frames(frame_w, frame_h, fps):
+    """
+    Calcola quanti frame annotati possiamo tenere in RAM.
+
+    Usa BUFFER_RAM_FRACTION della RAM libera al momento dell'avvio.
+    Imposta sempre un minimo (fps * BUFFER_PREFILL_SECONDS * 2) e un
+    massimo ragionevole di 1200 frame (~40s a 30fps) per non esagerare.
+    """
+    try:
+        import psutil
+        ram_libera = psutil.virtual_memory().available
+    except ImportError:
+        # psutil non installato: fallback conservativo a 150 frame
+        print("[Buffer] psutil non trovato, uso buffer fisso di 150 frame.")
+        return 150
+
+    bytes_per_frame = frame_w * frame_h * 3  # BGR
+    budget_bytes = ram_libera * BUFFER_RAM_FRACTION
+    max_frames = int(budget_bytes / bytes_per_frame)
+
+    # Minimo: almeno il doppio del prefill
+    min_frames = max(int(fps * BUFFER_PREFILL_SECONDS * 2), 30)
+    max_frames = max(max_frames, min_frames)
+
+    # Cap a 1200 frame per non esagerare
+    max_frames = min(max_frames, 1200)
+
+    ram_usata_mb = (max_frames * bytes_per_frame) / 1024 / 1024
+    ram_libera_mb = ram_libera / 1024 / 1024
+    print(f"[Buffer] RAM libera: {ram_libera_mb:.0f} MB  →  "
+          f"buffer: {max_frames} frame ({ram_usata_mb:.0f} MB, "
+          f"{max_frames/fps:.1f}s a {fps:.1f}fps)")
+
+    return max_frames
+
+
 def run_file_mode(detector, capture, output_path, show_display, frame_skip):
     """
-    Modalità FILE: processa tutto il video e salva l'output annotato.
-    Barra di progresso su console. Display opzionale.
-    Usa timestamp reali per pacing corretto della finestra video.
+    Modalità FILE con buffer di display.
+
+    - Thread inference: elabora frame e li mette in display_queue +
+      li scrive su disco tramite recorder.
+    - Thread principale (display): legge da display_queue e mostra
+      i frame a schermo al ritmo originale del video.
+
+    Il buffer (display_queue) permette all'inference di "correre avanti"
+    rispetto al display: la finestra è sempre fluida anche se l'inference
+    è variabile. Prima di iniziare il display si aspetta BUFFER_PREFILL_SECONDS
+    secondi di frame pronti nel buffer.
     """
     recorder = VideoRecorder(
         output_path, capture.width, capture.height, capture.fps
@@ -123,181 +172,326 @@ def run_file_mode(detector, capture, output_path, show_display, frame_skip):
     recorder.start()
 
     total = capture.total_frames
-    processed = 0
-    t_start = time.time()
+    fps = capture.fps if capture.fps > 0 else 30.0
+    frame_interval = 1.0 / fps  # secondi per frame per il display
 
-    # Intervallo reale tra frame (secondi)
-    frame_interval = 1.0 / capture.fps if capture.fps > 0 else 1.0 / 30
+    # ── Calcola dimensione buffer ─────────────────────────────
+    buf_size = _calcola_buffer_frames(capture.width, capture.height, fps)
+    prefill_frames = max(1, int(fps * BUFFER_PREFILL_SECONDS))
+
+    # Sentinel: None nella queue segnala la fine al thread display
+    display_queue = queue.Queue(maxsize=buf_size) if show_display else None
+
+    # Flag condiviso per stop anticipato (utente preme Q)
+    stop_event = threading.Event()
 
     print(f"\n{'='*50}")
     print(f"  Modalità FILE — {total} frame da processare")
     if show_display:
-        print(f"  Display attivo a {capture.fps:.1f} FPS")
+        print(f"  Pre-fill: {prefill_frames} frame ({BUFFER_PREFILL_SECONDS}s) "
+              f"poi display a {fps:.1f} FPS")
     print(f"{'='*50}\n")
 
-    # Timestamp del prossimo frame da mostrare
-    t_next_display = time.time()
+    t_start = time.time()
+    processed = 0
 
-    while capture.is_running():
-        frame = capture.read()
-        if frame is None:
-            if not capture.is_running():
+    # ── Thread inference ──────────────────────────────────────
+    def inference_loop():
+        nonlocal processed
+        frame_count = 0
+
+        while capture.is_running() and not stop_event.is_set():
+            frame = capture.read()
+            if frame is None:
+                if not capture.is_running():
+                    break
+                time.sleep(0.001)
+                continue
+
+            frame_count += 1
+            processed = frame_count
+
+            # Frame skipping
+            if frame_skip > 0 and (frame_count % (frame_skip + 1)) != 1:
+                recorder.write(frame)
+                if display_queue is not None:
+                    # Metti comunque il frame grezzo nel buffer display
+                    # così il video non salta visivamente
+                    try:
+                        display_queue.put(frame, timeout=1.0)
+                    except queue.Full:
+                        pass
+                continue
+
+            frame_annotato, detections = detector.process_frame(frame)
+            recorder.write(frame_annotato)
+            _stampa_eventi(detector)
+
+            # Barra di progresso
+            if total > 0:
+                pct = frame_count / total * 100
+                bar_len = 30
+                filled = int(bar_len * frame_count / total)
+                bar = "█" * filled + "─" * (bar_len - filled)
+                elapsed = time.time() - t_start
+                fps_actual = frame_count / elapsed if elapsed > 0 else 0
+                eta = (total - frame_count) / fps_actual if fps_actual > 0 else 0
+                print(
+                    f"\r  [{bar}] {pct:5.1f}%  "
+                    f"{frame_count}/{total}  "
+                    f"{fps_actual:.1f} FPS inf.  "
+                    f"buf {display_queue.qsize() if display_queue else 0}/{buf_size}  "
+                    f"ETA {eta:.0f}s  ",
+                    end="", flush=True,
+                )
+
+            if display_queue is not None:
+                # Blocca se il buffer è pieno (inference troppo veloce):
+                # meglio rallentare l'inference che perdere frame o esplodere RAM.
+                while not stop_event.is_set():
+                    try:
+                        display_queue.put(frame_annotato, timeout=0.2)
+                        break
+                    except queue.Full:
+                        continue
+
+        # Segnala fine al thread display
+        if display_queue is not None:
+            try:
+                display_queue.put(None, timeout=5.0)
+            except queue.Full:
+                pass
+
+    inf_thread = threading.Thread(target=inference_loop, daemon=True)
+    inf_thread.start()
+
+    # ── Display loop (thread principale) ─────────────────────
+    if show_display:
+        # Aspetta il pre-fill
+        print(f"  Attendo pre-fill buffer ({prefill_frames} frame)...",
+              end="", flush=True)
+        while display_queue.qsize() < prefill_frames and inf_thread.is_alive():
+            time.sleep(0.05)
+        print(f" pronto! ({display_queue.qsize()} frame in buffer)\n")
+
+        t_next = time.time()
+
+        while not stop_event.is_set():
+            try:
+                frame_out = display_queue.get(timeout=1.0)
+            except queue.Empty:
+                # Buffer esaurito: aspetta l'inference
+                if not inf_thread.is_alive():
+                    break
+                continue
+
+            if frame_out is None:
+                # Sentinel: fine video
                 break
-            time.sleep(0.001)
-            continue
 
-        processed += 1
-
-        # Frame skipping
-        if frame_skip > 0 and (processed % (frame_skip + 1)) != 1:
-            recorder.write(frame)
-            continue
-
-        frame_annotato, detections = detector.process_frame(frame)
-        recorder.write(frame_annotato)
-
-        # Stampa eventi ingresso/uscita
-        _stampa_eventi(detector)
-
-        # Barra di progresso
-        if total > 0:
-            pct = processed / total * 100
-            bar_len = 30
-            filled = int(bar_len * processed / total)
-            bar = "█" * filled + "─" * (bar_len - filled)
-            elapsed = time.time() - t_start
-            fps_actual = processed / elapsed if elapsed > 0 else 0
-            eta = (total - processed) / fps_actual if fps_actual > 0 else 0
-            print(
-                f"\r  [{bar}] {pct:5.1f}%  "
-                f"{processed}/{total}  "
-                f"{fps_actual:.1f} FPS  "
-                f"ETA {eta:.0f}s  ",
-                end="", flush=True,
-            )
-
-        # Display con pacing basato su tempo reale
-        if show_display:
-            vis = ridimensiona_per_display(frame_annotato, MAX_DISPLAY_WIDTH)
+            vis = ridimensiona_per_display(frame_out, MAX_DISPLAY_WIDTH)
             cv2.imshow(FINESTRA_NOME, vis)
 
-            # Aspetta il tempo giusto: quanto manca al prossimo frame?
+            # Pacing: aspetta il tempo giusto per il prossimo frame
+            t_next += frame_interval
             now = time.time()
-            t_next_display += frame_interval
-            wait_s = t_next_display - now
-            # Se siamo in ritardo (inference lenta), non aspettare
-            # e resetta il timer per non accumulare
+            wait_s = t_next - now
             if wait_s < 0:
-                t_next_display = now
+                # Siamo in ritardo (buffer quasi vuoto): non accumulare
+                t_next = now
                 wait_ms = 1
             else:
                 wait_ms = max(1, int(wait_s * 1000))
 
             if cv2.waitKey(wait_ms) & 0xFF in (ord("q"), 27):
                 print("\n\n  Interrotto dall'utente.")
+                stop_event.set()
                 break
 
-    print()  # newline dopo la barra
+        cv2.destroyAllWindows()
+
+    # Aspetta che l'inference finisca
+    inf_thread.join()
+    print()  # newline dopo la barra di progresso
     recorder.stop()
     capture.stop()
-
-    if show_display:
-        cv2.destroyAllWindows()
 
 
 def run_live_mode(detector, capture, recorder, show_display, headless, frame_skip):
     """
-    Modalità LIVE: processa frame in tempo reale dalla webcam o RTSP.
-    Mostra finestra + opzionalmente registra.
+    Modalità LIVE con buffer di display.
+
+    - Thread inference: cattura frame dalla sorgente, li processa con
+      il detector, e li mette in un buffer (display_queue).
+    - Thread principale (display): legge da display_queue e mostra
+      i frame a schermo.
+
+    Il buffer è PICCOLO (pochi frame) perché in live vogliamo stare
+    il più vicini possibile al tempo reale. Quando il buffer è pieno,
+    il thread di inference SCARTA il frame più vecchio dal buffer per
+    fare spazio al nuovo, così il display non resta mai indietro.
     """
     if recorder:
         recorder.start()
 
-    frame_count = 0
-    t_start = time.time()
-    fps_display = 0.0
-    fps_update_interval = 0.5  # aggiorna l'FPS ogni 0.5s
-    t_fps = time.time()
-    frames_in_interval = 0
+    # Buffer piccolo per il live: 5 frame sono sufficienti per
+    # assorbire le variazioni di tempo di inference senza
+    # accumulare ritardo percepibile.
+    LIVE_BUFFER_SIZE = 5
+
+    display_queue = queue.Queue(maxsize=LIVE_BUFFER_SIZE) if show_display else None
+    stop_event = threading.Event()
+
+    # Contatori condivisi per FPS e headless logging
+    stats = {
+        "frame_count": 0,
+        "fps_inference": 0.0,
+        "last_detections": [],
+    }
 
     print(f"\n{'='*50}")
     print(f"  Modalità LIVE — premi 'q' o ESC per uscire")
     if recorder:
         print(f"  Registrazione attiva")
+    if show_display:
+        print(f"  Buffer display: {LIVE_BUFFER_SIZE} frame")
     print(f"{'='*50}\n")
 
-    last_frame = None
+    # ── Thread inference ──────────────────────────────────────
+    def inference_loop():
+        frame_count = 0
+        t_fps = time.time()
+        frames_in_interval = 0
+        fps_update_interval = 0.5
+        last_frame = None
 
-    while capture.is_running():
-        frame = capture.read()
-        if frame is None:
-            time.sleep(0.01)
-            continue
+        while capture.is_running() and not stop_event.is_set():
+            frame = capture.read()
+            if frame is None:
+                time.sleep(0.01)
+                continue
 
-        # Evita di riprocessare lo stesso frame identico
-        if frame is last_frame:
-            time.sleep(0.001)
-            continue
-        last_frame = frame
+            # Evita di riprocessare lo stesso frame
+            if frame is last_frame:
+                time.sleep(0.001)
+                continue
+            last_frame = frame
 
-        frame_count += 1
+            frame_count += 1
 
-        # Frame skipping
-        if frame_skip > 0 and (frame_count % (frame_skip + 1)) != 1:
+            # Frame skipping
+            if frame_skip > 0 and (frame_count % (frame_skip + 1)) != 1:
+                if recorder:
+                    recorder.write(frame)
+                continue
+
+            frame_annotato, detections = detector.process_frame(frame)
+            _stampa_eventi(detector)
+
+            # Calcola FPS inference
+            frames_in_interval += 1
+            now = time.time()
+            if now - t_fps >= fps_update_interval:
+                stats["fps_inference"] = frames_in_interval / (now - t_fps)
+                frames_in_interval = 0
+                t_fps = now
+
+            stats["frame_count"] = frame_count
+            stats["last_detections"] = detections
+
+            # Overlay FPS sul frame
+            cv2.putText(
+                frame_annotato,
+                f"FPS: {stats['fps_inference']:.1f}",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2,
+            )
+
             if recorder:
-                recorder.write(frame)
-            continue
+                recorder.write(frame_annotato)
 
-        frame_annotato, detections = detector.process_frame(frame)
+            if display_queue is not None:
+                # Se il buffer è pieno, SCARTA il frame più vecchio
+                # per fare spazio (non bloccare mai in live).
+                if display_queue.full():
+                    try:
+                        display_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                try:
+                    display_queue.put_nowait(frame_annotato)
+                except queue.Full:
+                    pass
 
-        # Stampa eventi ingresso/uscita
-        _stampa_eventi(detector)
+            # Headless: stampa periodica
+            if headless and frame_count % 30 == 0:
+                n_det = len(detections)
+                labels = ", ".join(d["label"] for d in detections[:5])
+                print(
+                    f"  Frame {frame_count} | "
+                    f"{stats['fps_inference']:.1f} FPS | "
+                    f"{n_det} detection{'s' if n_det != 1 else ''}"
+                    f"{' | ' + labels if labels else ''}",
+                )
 
-        # Calcola FPS reale
-        frames_in_interval += 1
-        now = time.time()
-        if now - t_fps >= fps_update_interval:
-            fps_display = frames_in_interval / (now - t_fps)
-            frames_in_interval = 0
-            t_fps = now
+        # Segnala fine al display
+        if display_queue is not None:
+            try:
+                display_queue.put(None, timeout=2.0)
+            except queue.Full:
+                pass
 
-        # Overlay FPS sul frame
-        cv2.putText(
-            frame_annotato,
-            f"FPS: {fps_display:.1f}",
-            (10, 30),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2,
-        )
+    inf_thread = threading.Thread(target=inference_loop, daemon=True)
+    inf_thread.start()
 
-        if recorder:
-            recorder.write(frame_annotato)
+    # ── Display loop (thread principale) ─────────────────────
+    if show_display:
+        while not stop_event.is_set():
+            try:
+                frame_out = display_queue.get(timeout=1.0)
+            except queue.Empty:
+                if not inf_thread.is_alive():
+                    break
+                continue
 
-        # Display
-        if show_display:
-            vis = ridimensiona_per_display(frame_annotato, MAX_DISPLAY_WIDTH)
-            cv2.imshow(FINESTRA_NOME, vis)
-            key = cv2.waitKey(1) & 0xFF
-            if key in (ord("q"), 27):
-                print("  Uscita dall'utente.")
+            if frame_out is None:
                 break
 
-        # Headless: stampa periodica su console
-        if headless and frame_count % 30 == 0:
-            elapsed = time.time() - t_start
-            n_det = len(detections)
-            labels = ", ".join(d["label"] for d in detections[:5])
-            print(
-                f"  Frame {frame_count} | {fps_display:.1f} FPS | "
-                f"{n_det} detection{'s' if n_det != 1 else ''}"
-                f"{' | ' + labels if labels else ''}",
-            )
+            vis = ridimensiona_per_display(frame_out, MAX_DISPLAY_WIDTH)
+            cv2.imshow(FINESTRA_NOME, vis)
+
+            # waitKey(1) = mostra subito il prossimo frame disponibile
+            # (nessun pacing artificiale in live: vogliamo tempo reale)
+            if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
+                print("  Uscita dall'utente.")
+                stop_event.set()
+                break
+
+        cv2.destroyAllWindows()
+
+    elif headless:
+        # Niente display: aspetta che il thread inference finisca
+        # (o che l'utente faccia Ctrl+C)
+        try:
+            inf_thread.join()
+        except KeyboardInterrupt:
+            print("\n  Interrotto (Ctrl+C).")
+            stop_event.set()
+
+    # Aspetta fine inference
+    stop_event.set()
+    inf_thread.join(timeout=5.0)
 
     if recorder:
         recorder.stop()
     capture.stop()
 
-    if show_display:
-        cv2.destroyAllWindows()
+
+def _is_http_source(source_str):
+    """True se la sorgente è un URL HTTP/HTTPS (es. server Render)."""
+    return isinstance(source_str, str) and (
+        source_str.startswith("http://") or source_str.startswith("https://")
+    )
 
 
 def main():
@@ -305,7 +499,6 @@ def main():
 
     # ── Prepara la sorgente ───────────────────────────────────
     source = parse_source(args.source)
-    is_file = isinstance(source, str) and not source.startswith("rtsp")
 
     # ── Carica il detector ────────────────────────────────────
     detector = DualDetector(
@@ -315,10 +508,15 @@ def main():
     )
 
     # ── Apri la sorgente video ────────────────────────────────
-    capture = ThreadedCapture(
-        source,
-        reconnect=(not is_file),  # reconnect solo per stream
-    )
+    if _is_http_source(source):
+        # Sorgente HTTP: polling da server remoto (es. Render)
+        capture = HttpPollingCapture(source)
+    else:
+        is_file = isinstance(source, str) and not source.startswith("rtsp")
+        capture = ThreadedCapture(
+            source,
+            reconnect=(not is_file),
+        )
 
     try:
         capture.start()
@@ -335,7 +533,7 @@ def main():
         run_file_mode(detector, capture, output_path, show_display, args.skip)
 
     else:
-        # ── LIVE MODE ─────────────────────────────────────
+        # ── LIVE MODE (webcam, RTSP, HTTP) ────────────────
         recorder = None
         if args.record:
             output_path = args.output or make_output_path(args.source, "live_rec")
