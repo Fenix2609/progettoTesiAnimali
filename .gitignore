@@ -1,0 +1,10 @@
+.venv/
+.idea/
+__pycache__/
+*.pyc
+models/best.pt
+output/
+*.mp4
+*.rar
+*.pt
+*.zip

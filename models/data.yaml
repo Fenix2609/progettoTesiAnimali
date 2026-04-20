@@ -1,0 +1,11 @@
+names:
+- argo
+- bobby
+- lessi
+- nero
+- rex
+- rocky
+nc: 6
+path: dataset
+train: images/train
+val: images/val
