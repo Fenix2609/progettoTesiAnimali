@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="it"> <!-- COMMENTO A CASO -->
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+  <title>Animal Detector — Camera</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      background: #0a0a0a;
+      color: #fff;
+      font-family: 'Courier New', monospace;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 20px;
+      padding: 20px;
+    }
+
+    h1 {
+      font-size: 1.1rem;
+      letter-spacing: 0.2em;
+      text-transform: uppercase;
+      color: #00c853;
+    }
+
+    #video {
+      width: 100%;
+      max-width: 400px;
+      border-radius: 8px;
+      border: 2px solid #00c853;
+      background: #111;
+    }
+
+    canvas { display: none; }
+
+    #status {
+      font-size: 0.85rem;
+      color: #888;
+      text-align: center;
+      min-height: 1.2em;
+    }
+
+    #status.attivo { color: #00c853; }
+    #status.errore { color: #ff4444; }
+
+    #btn {
+      padding: 14px 40px;
+      background: #00c853;
+      color: #000;
+      border: none;
+      border-radius: 6px;
+      font-family: 'Courier New', monospace;
+      font-size: 1rem;
+      font-weight: bold;
+      letter-spacing: 0.1em;
+      cursor: pointer;
+      text-transform: uppercase;
+      transition: background 0.2s;
+    }
+
+    #btn:disabled {
+      background: #444;
+      color: #888;
+      cursor: not-allowed;
+    }
+
+    #btn.stop { background: #ff4444; color: #fff; }
+
+    #fps-info {
+      font-size: 0.75rem;
+      color: #555;
+    }
+  </style>
+</head>
+<body>
+
+  <h1>🐾 Animal Detector</h1>
+
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="canvas"></canvas>
+
+  <button id="btn" onclick="toggle()">Avvia Camera</button>
+
+  <div id="status">In attesa...</div>
+  <div id="fps-info" id="fps-info"></div>
+
+<script>
+  const video   = document.getElementById("video");
+  const canvas  = document.getElementById("canvas");
+  const btn     = document.getElementById("btn");
+  const status  = document.getElementById("status");
+  const fpsInfo = document.getElementById("fps-info");
+
+  const ctx = canvas.getContext("2d");
+
+  // Manda un frame ogni FPS_INTERVAL ms
+  const FPS_INTERVAL = 150;   // ~6-7 fps → buon compromesso latenza/banda
+  const JPEG_QUALITY = 0.7;
+
+  let attivo = false;
+  let intervalId = null;
+  let frameCount = 0;
+  let t0 = Date.now();
+
+  async function toggle() {
+    if (!attivo) {
+      await avvia();
+    } else {
+      ferma();
+    }
+  }
+
+  async function avvia() {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "environment", width: 640, height: 480 },
+        audio: false
+      });
+      video.srcObject = stream;
+      await video.play();
+
+      attivo = true;
+      btn.textContent = "Stop";
+      btn.classList.add("stop");
+      setStatus("Connesso — invio frame...", "attivo");
+
+      frameCount = 0;
+      t0 = Date.now();
+
+      intervalId = setInterval(mandaFrame, FPS_INTERVAL);
+
+    } catch (e) {
+      setStatus("Errore fotocamera: " + e.message, "errore");
+    }
+  }
+
+  function ferma() {
+    clearInterval(intervalId);
+    intervalId = null;
+    attivo = false;
+
+    if (video.srcObject) {
+      video.srcObject.getTracks().forEach(t => t.stop());
+      video.srcObject = null;
+    }
+
+    btn.textContent = "Avvia Camera";
+    btn.classList.remove("stop");
+    setStatus("Fermato.", "");
+    fpsInfo.textContent = "";
+  }
+
+  async function mandaFrame() {
+    if (!attivo || video.readyState < 2) return;
+
+    canvas.width  = video.videoWidth  || 640;
+    canvas.height = video.videoHeight || 480;
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+    canvas.toBlob(async (blob) => {
+      if (!blob) return;
+
+      const form = new FormData();
+      form.append("frame", blob, "frame.jpg");
+
+      try {
+        const res = await fetch("/upload", { method: "POST", body: form });
+        if (!res.ok) throw new Error("HTTP " + res.status);
+
+        // Calcola FPS effettivi
+        frameCount++;
+        const elapsed = (Date.now() - t0) / 1000;
+        if (elapsed > 0) {
+          fpsInfo.textContent = `${(frameCount / elapsed).toFixed(1)} fps inviati`;
+        }
+
+      } catch (e) {
+        setStatus("Errore invio: " + e.message, "errore");
+      }
+    }, "image/jpeg", JPEG_QUALITY);
+  }
+
+  function setStatus(msg, cls) {
+    status.textContent = msg;
+    status.className = cls || "";
+  }
+</script>
+
+</body>
+</html>
