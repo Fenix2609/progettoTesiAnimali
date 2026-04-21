@@ -16,7 +16,12 @@ import threading
 import queue
 import time
 
-import requests
+try:
+    import urllib.request
+    import urllib.error
+    _HAS_URLLIB = True
+except ImportError:
+    _HAS_URLLIB = False
 
 
 # ══════════════════════════════════════════════════════════════
@@ -223,8 +228,6 @@ class HttpPollingCapture:
         self._running = False
         self._thread = None
 
-        self.session = requests.Session()
-
         # Proprietà — saranno impostate dopo il primo frame ricevuto
         self.width = 0
         self.height = 0
@@ -323,18 +326,29 @@ class HttpPollingCapture:
     def _scarica_frame(self):
         """Scarica un singolo frame JPEG dall'endpoint e lo decodifica."""
         try:
-            resp = self._session.get(self.source, timeout=self._timeout)
-            if resp.status_code == 404:
-                return None
-            if resp.status_code != 200:
-                print(f"[HTTP] Errore HTTP {resp.status_code}")
-                return None
-            data = resp.content
-            if not data:
-                return None
-            arr = np.frombuffer(data, dtype=np.uint8)
-            return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            req = urllib.request.Request(self.source)
+            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+                if resp.status != 200:
+                    return None
+                data = resp.read()
+                if not data:
+                    return None
 
-        except requests.exceptions.RequestException as e:
-            print(f"[HTTP] Errore connessione: {e}")
+            # Decodifica JPEG → numpy BGR
+            arr = np.frombuffer(data, dtype=np.uint8)
+            frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            return frame
+
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                # Nessun frame disponibile (telefono non ha ancora mandato)
+                pass
+            else:
+                print(f"[HTTP] Errore HTTP {e.code}: {e.reason}")
+            return None
+        except urllib.error.URLError as e:
+            print(f"[HTTP] Errore connessione: {e.reason}")
+            return None
+        except Exception as e:
+            print(f"[HTTP] Errore: {e}")
             return None
