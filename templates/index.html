@@ -83,7 +83,8 @@
   const ctx     = canvas.getContext("2d");
 
   // Manda un frame ogni FPS_INTERVAL ms
-  const FPS_INTERVAL = 150;   // ~6-7 fps
+  //const FPS_INTERVAL = 150;   // ~6-7 fps
+  const FPS_INTERVAL = 80;
   const JPEG_QUALITY = 0.7;
 
   let attivo = false;
@@ -102,7 +103,8 @@
   async function avvia() {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: "environment", width: 640, height: 480 },
+        //video: { facingMode: "environment", width: 640, height: 480 }, commento e provo adAbbassare la risoluziione
+        video: { facingMode: "environment", width: 320, height: 240 },
         audio: false
       });
       video.srcObject = stream;
