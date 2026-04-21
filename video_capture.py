@@ -36,7 +36,7 @@ class ThreadedCapture:
     un frame non è disponibile. Nessun frame viene perso.
 
     Per LIVE (webcam/RTSP): usa un buffer singolo. read() restituiscee
-    sempre l'ultimo frame, saltando quelli intermedi.
+    sempre l'ultimo frame, saltando quelli intermedi..
     """
 
     def __init__(self, source, reconnect=True, reconnect_delay=3.0,
