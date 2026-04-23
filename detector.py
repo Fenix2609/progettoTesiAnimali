@@ -88,7 +88,7 @@ class DualDetector:
         # frame_ultimo_visto[nome] = ultimo frame in cui è stato visto
         self._frame_ultimo_visto = {}
         # Coda eventi: list di dict {"tipo": "ingresso"|"uscita", "nome": str}
-        # svuotata da main.py dopo ogni frame
+        # svuotata da main5.py dopo ogni frame
         self.eventi = []
 
     def _carica_classi_custom(self):

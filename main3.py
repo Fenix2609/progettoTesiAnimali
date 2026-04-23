@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-# ── main.py ───────────────────────────────────────────────────
+# ── main5.py ───────────────────────────────────────────────────
 # Entry point del progetto Animal Detector Live.
 #
 # Uso:
-#   python main.py --source video .mp4              # file MP4
-#   python main.py --source 0                      # webcam
-#   python main.py --source rtsp://user:pass@IP    # telecamera IP
-#   python main.py --source 0 --record             # live + registra
-#   python main.py --source video.mp4 --no-display # solo output file
-#   python main.py --source 0 --headless           # server senza GUI
+#   python main5.py --source video .mp4              # file MP4
+#   python main5.py --source 0                      # webcam
+#   python main5.py --source rtsp://user:pass@IP    # telecamera IP
+#   python main5.py --source 0 --record             # live + registra
+#   python main5.py --source video.mp4 --no-display # solo output file
+#   python main5.py --source 0 --headless           # server senza GUI
 # ─────────────────────────────────────────────────────────────
 
 import argparse
@@ -33,11 +33,11 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Esempi:
-  python main.py --source video_test.mp4
-  python main.py --source 0
-  python main.py --source rtsp://admin:1234@192.168.1.10:554/stream1
-  python main.py --source 0 --record
-  python main.py --source video.mp4 --output mio_output.mp4
+  python main5.py --source video_test.mp4
+  python main5.py --source 0
+  python main5.py --source rtsp://admin:1234@192.168.1.10:554/stream1
+  python main5.py --source 0 --record
+  python main5.py --source video.mp4 --output mio_output.mp4
         """,
     )
 

@@ -49,19 +49,19 @@ Se non è installato:
 ### File video (.mp4)
 
 ```bash
-python main.py --source video_test.mp4
+python main5.py --source video_test.mp4
 ```
 
 ### Webcam
 
 ```bash
-python main.py --source 0
+python main5.py --source 0
 ```
 
 ### Telecamera IP (RTSP)
 
 ```bash
-python main.py --source "rtsp://admin:password@192.168.1.10:554/stream1"
+python main5.py --source "rtsp://admin:password@192.168.1.10:554/stream1"
 ```
 
 ### Opzioni utili
@@ -81,19 +81,19 @@ python main.py --source "rtsp://admin:password@192.168.1.10:554/stream1"
 
 ```bash
 # Webcam + registra output
-python main.py -s 0 --record
+python main5.py -s 0 --record
 
 # File video, solo processing senza finestra
-python main.py -s video.mp4 --no-display
+python main5.py -s video.mp4 --no-display
 
 # RTSP su server headless con skip frame
-python main.py -s "rtsp://..." --headless --skip 2
+python main5.py -s "rtsp://..." --headless --skip 2
 
 # Usa GPU esplicitamente
-python main.py -s 0 --device cuda
+python main5.py -s 0 --device cuda
 
 # Processa veloce su CPU (1 frame ogni 3)
-python main.py -s video.mp4 --skip 2 --device cpu
+python main5.py -s video.mp4 --skip 2 --device cpu
 ```
 
 ## Colori dei bounding box
