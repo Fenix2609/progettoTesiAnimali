@@ -6,4 +6,6 @@ COPY . .
 
 RUN pip install -r requirements.txt
 
-CMD ["python", "server.py"]
+EXPOSE 8000
+
+CMD ["gunicorn", "--bind=0.0.0.0:8000", "server:app"]
