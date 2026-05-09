@@ -324,10 +324,10 @@ class DualDetector:
             colore = det["colore"]
             testo = f"{det['label']} {det['conf']:.0%}"
 
-            cv2.rectangle(frame_annotato, (x1, y1), (x2, y2), colore, 2)
+            cv2.rectangle(frame_annotato, (x1, y1), (x2, y2), colore, 1)
             cv2.putText(
-                frame_annotato, testo, (x1, y1 - 8),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, colore, 2,
+                frame_annotato, testo, (x1, y1 - 5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, colore, 1,
             )
 
         return frame_annotato, detections

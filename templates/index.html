@@ -82,15 +82,31 @@
   const fpsInfo = document.getElementById("fps-info");
   const ctx     = canvas.getContext("2d");
 
-  // Manda un frame ogni FPS_INTERVAL ms
-  //const FPS_INTERVAL = 150;   // ~6-7 fps
-  const FPS_INTERVAL = 80;
+  const FPS_INTERVAL = 80;    // ~12 fps
   const JPEG_QUALITY = 0.7;
 
   let attivo = false;
   let intervalId = null;
   let frameCount = 0;
   let t0 = Date.now();
+
+  // Notifica al server quando l'utente chiude o lascia la pagina,
+  // così il dispositivo viene liberato e un altro può connettersi.
+  window.addEventListener("beforeunload", () => {
+    if (attivo) {
+      navigator.sendBeacon("/disconnect");
+    }
+  });
+
+  // Notifica anche se la pagina va in background su mobile
+  // (es. l'utente switcha app o blocca lo schermo)
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden && attivo) {
+      // Non disconnettiamo subito: il timeout del server (30s)
+      // gestirà il caso in cui l'utente non torni.
+      // Ma se torna, l'invio frame riprende automaticamente.
+    }
+  });
 
   async function toggle() {
     if (!attivo) {
@@ -103,7 +119,6 @@
   async function avvia() {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        //video: { facingMode: "environment", width: 640, height: 480 }, commento e provo adAbbassare la risoluziione
         video: { facingMode: "environment", width: 320, height: 240 },
         audio: false
       });
@@ -128,6 +143,9 @@
     intervalId = null;
     attivo = false;
 
+    // Notifica al server la disconnessione volontaria
+    fetch("/disconnect", { method: "POST" }).catch(() => {});
+
     if (video.srcObject) {
       video.srcObject.getTracks().forEach(t => t.stop());
       video.srcObject = null;
@@ -142,8 +160,8 @@
   async function mandaFrame() {
     if (!attivo || video.readyState < 2) return;
 
-    canvas.width  = video.videoWidth  || 640;
-    canvas.height = video.videoHeight || 480;
+    canvas.width  = video.videoWidth  || 320;
+    canvas.height = video.videoHeight || 240;
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
     canvas.toBlob(async (blob) => {
@@ -156,7 +174,6 @@
         const res = await fetch("/upload", { method: "POST", body: form });
         if (!res.ok) throw new Error("HTTP " + res.status);
 
-        // Calcola FPS effettivi
         frameCount++;
         const elapsed = (Date.now() - t0) / 1000;
         if (elapsed > 0) {
